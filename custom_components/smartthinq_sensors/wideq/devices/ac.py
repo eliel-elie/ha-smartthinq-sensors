@@ -902,11 +902,9 @@ class AirConditionerDevice(Device):
 
     async def _pre_update_v2(self):
         """Call additional methods before data update for v2 API."""
-        # Only request live telemetry events when the AC is initialized and powered on
-        if not self._model_info or not (self._status and self._status.is_on):
-            return
-        keys = self._get_cmd_keys(CMD_ENABLE_EVENT_V2)
-        await self.set(keys[0], keys[1], key=keys[2], value="70", ctrl_path="control")
+        # LG mobile API blocks allEventEnable with error 9006; ThinQ2 AC devices
+        # publish state and energy telemetry automatically via MQTT push.
+        return
 
     async def _get_device_info(self):
         """
@@ -1157,12 +1155,11 @@ class AirConditionerStatus(DeviceStatus):
     @property
     def energy_current(self):
         """Return current energy usage."""
+        if not self.is_on:
+            return self._update_feature(AirConditionerFeatures.ENERGY_CURRENT, 0, False)
         key = self._get_state_key(STATE_POWER)
         if (value := self.to_int_or_none(self._data.get(key))) is None:
             return None
-        if value <= 50 and not self.is_on:
-            # decrease power for devices that always return 50 when standby
-            value = 5
         return self._update_feature(AirConditionerFeatures.ENERGY_CURRENT, value, False)
 
     @property

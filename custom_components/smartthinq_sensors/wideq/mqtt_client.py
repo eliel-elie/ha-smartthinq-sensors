@@ -10,7 +10,7 @@ import os
 import ssl
 import tempfile
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -27,6 +27,15 @@ _LOGGER = logging.getLogger(__name__)
 ROUTE_URL = "https://common.lgthinq.com/route"
 CLIENT_REG_PATH = "service/users/client"
 CLIENT_CERT_PATH = "service/users/client/certificate"
+
+ANDROID_ROUTE_HEADERS = {
+    "User-Agent": "okhttp/4.10.0",
+    "x-Device-Platform": "AOS",
+    "x-platform-type": "ANDROID/13",
+    "x-iot-sdk-type": "aws-sdk-android",
+}
+_DASHBOARD_REFRESH = "dashboardRefresh"
+_FUNC_SYNC_REFRESH = "funcSyncRefresh"
 
 MQTT_KEEPALIVE = 60
 CONNECT_TIMEOUT = 20
@@ -65,11 +74,13 @@ class ThinQMQTTClient:
         client: ClientAsync,
         on_push_callback: Callable[[str, dict[str, Any]], None],
         on_connect_callback: Callable[[], None] | None = None,
+        on_refresh_callback: Callable[[str], None] | None = None,
     ) -> None:
         """Initialize the ThinQ MQTT push client."""
         self._client = client
         self._on_push_callback = on_push_callback
         self._on_connect_callback = on_connect_callback
+        self._on_refresh_callback = on_refresh_callback
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._runner_task: asyncio.Task | None = None
@@ -195,6 +206,7 @@ class ThinQMQTTClient:
                 ROUTE_URL,
                 access_token=auth.access_token,
                 user_number=auth.user_number,
+                headers=ANDROID_ROUTE_HEADERS,
             )
         )
         if not isinstance(result, dict):
@@ -236,61 +248,108 @@ class ThinQMQTTClient:
             return cert_pem + "\n"
         return f"-----BEGIN CERTIFICATE-----\n{cert_pem}\n-----END CERTIFICATE-----\n"
 
+    async def _post_certificate_direct(self, csr_pem: str) -> dict[str, Any]:
+        """Request mTLS certificate directly without security_key (Android APK flow)."""
+        auth = self._client.auth
+        core = auth.gateway.core
+        cert_url = urljoin(auth.gateway.thinq2_uri, CLIENT_CERT_PATH)
+        headers = core._thinq2_headers(
+            client_id=core._get_client_id(auth.user_number),
+            access_token=auth.access_token,
+            user_number=auth.user_number,
+            country=core.country,
+            language=core.language,
+            security_key=False,
+        )
+        async with core._get_session().post(
+            url=cert_url,
+            json={"csr": csr_pem},
+            headers=headers,
+            timeout=core._timeout,
+            raise_for_status=False,
+        ) as resp:
+            out = await core._get_json_resp(resp)
+
+        if "resultCode" not in out:
+            raise exc.APIError("-1", out)
+        return core._manage_lge_result(out, True, auth.user_number)
+
     async def async_register_client_and_get_cert(
         self,
     ) -> tuple[str, str, list[str]]:
         """Register client session and obtain a signed mTLS certificate."""
         await self._client.refresh_auth()
 
-        try:
-            await self._call_with_client_id_retry(
-                lambda: self._client.session.post2(CLIENT_REG_PATH, {})
-            )
-        except (
-            exc.InvalidCredentialError,
-            exc.NotLoggedInError,
-            exc.TokenError,
-            exc.UseOfficialAPIError,
-        ):
-            raise
-        except exc.APIError as err:
-            # Client ID may already be registered on LG backend
-            _LOGGER.debug("Client registration returned non-fatal error: %s", err)
-
         key_pem, csr_pem = await asyncio.to_thread(self._generate_csr)
-        csr_clean = (
-            csr_pem.replace("-----BEGIN CERTIFICATE REQUEST-----", "")
-            .replace("-----END CERTIFICATE REQUEST-----", "")
-            .replace("\r", "")
-            .replace("\n", "")
-            .strip()
-        )
+        cert_result: dict[str, Any] | None = None
 
-        try:
-            cert_result = await self._call_with_client_id_retry(
-                lambda: self._client.session.post2(
-                    CLIENT_CERT_PATH,
-                    {"service-code": SVC_CODE, "csr": csr_clean},
+        thinq2_uri = getattr(self._client.auth.gateway, "thinq2_uri", None)
+        if isinstance(thinq2_uri, str) and thinq2_uri:
+            try:
+                cert_result = await self._call_with_client_id_retry(
+                    lambda: self._post_certificate_direct(csr_pem)
                 )
-            )
-        except (
-            exc.InvalidCredentialError,
-            exc.NotLoggedInError,
-            exc.TokenError,
-            exc.UseOfficialAPIError,
-        ):
-            raise
-        except (exc.InvalidRequestError, exc.APIError) as err:
-            _LOGGER.debug(
-                "Certificate request with stripped CSR failed (%s), retrying full PEM",
-                err,
-            )
-            cert_result = await self._call_with_client_id_retry(
-                lambda: self._client.session.post2(
-                    CLIENT_CERT_PATH,
-                    {"service-code": SVC_CODE, "csr": csr_pem},
+            except (
+                exc.InvalidCredentialError,
+                exc.NotLoggedInError,
+                exc.TokenError,
+            ):
+                raise
+            except Exception as err:  # pylint: disable=broad-except
+                _LOGGER.debug(
+                    "Direct certificate request failed (%s), falling back to client registration flow",
+                    err,
                 )
+
+        if cert_result is None:
+            try:
+                await self._call_with_client_id_retry(
+                    lambda: self._client.session.post2(CLIENT_REG_PATH, {})
+                )
+            except (
+                exc.InvalidCredentialError,
+                exc.NotLoggedInError,
+                exc.TokenError,
+                exc.UseOfficialAPIError,
+            ):
+                raise
+            except exc.APIError as err:
+                # Client ID may already be registered on LG backend
+                _LOGGER.debug("Client registration returned non-fatal error: %s", err)
+
+            csr_clean = (
+                csr_pem.replace("-----BEGIN CERTIFICATE REQUEST-----", "")
+                .replace("-----END CERTIFICATE REQUEST-----", "")
+                .replace("\r", "")
+                .replace("\n", "")
+                .strip()
             )
+
+            try:
+                cert_result = await self._call_with_client_id_retry(
+                    lambda: self._client.session.post2(
+                        CLIENT_CERT_PATH,
+                        {"service-code": SVC_CODE, "csr": csr_clean},
+                    )
+                )
+            except (
+                exc.InvalidCredentialError,
+                exc.NotLoggedInError,
+                exc.TokenError,
+                exc.UseOfficialAPIError,
+            ):
+                raise
+            except (exc.InvalidRequestError, exc.APIError) as err:
+                _LOGGER.debug(
+                    "Certificate request with stripped CSR failed (%s), retrying full PEM",
+                    err,
+                )
+                cert_result = await self._call_with_client_id_retry(
+                    lambda: self._client.session.post2(
+                        CLIENT_CERT_PATH,
+                        {"service-code": SVC_CODE, "csr": csr_pem},
+                    )
+                )
 
         if not isinstance(cert_result, dict) or "certificatePem" not in cert_result:
             raise exc.InvalidResponseError(
@@ -358,7 +417,10 @@ class ThinQMQTTClient:
                     f"Missing mqttServer in route response: {route}"
                 )
 
-        parsed = urlparse(self._mqtt_server_url)
+        server_url = self._mqtt_server_url
+        if "://" not in server_url:
+            server_url = f"ssl://{server_url}"
+        parsed = urlparse(server_url)
         host = parsed.hostname
         port = parsed.port or 8883
         if not host:
@@ -477,9 +539,36 @@ class ThinQMQTTClient:
         if not isinstance(payload, dict):
             return
 
-        device_id = payload.get("deviceId")
+        device_id = payload.get("deviceId") or self._extract_device_id_from_topic(
+            msg.topic
+        )
         if not device_id:
             return
+
+        data_block = payload.get("data")
+        if isinstance(data_block, dict):
+            state_block = data_block.get("state")
+            if isinstance(state_block, dict):
+                desired = state_block.get("desired")
+                if isinstance(desired, dict) and (
+                    desired.get(_DASHBOARD_REFRESH) == "true"
+                    or desired.get(_FUNC_SYNC_REFRESH) == "true"
+                ):
+                    flag_name = (
+                        _DASHBOARD_REFRESH
+                        if desired.get(_DASHBOARD_REFRESH) == "true"
+                        else _FUNC_SYNC_REFRESH
+                    )
+                    _LOGGER.debug(
+                        "ThinQ MQTT %s flag received for device %s",
+                        flag_name,
+                        device_id,
+                    )
+                    if self._on_refresh_callback and self._loop:
+                        self._loop.call_soon_threadsafe(
+                            self._on_refresh_callback, device_id
+                        )
+                    return
 
         report = self._extract_report(payload)
         if not report:
@@ -495,6 +584,15 @@ class ThinQMQTTClient:
         )
         if self._loop:
             self._loop.call_soon_threadsafe(self._on_push_callback, device_id, report)
+
+    @staticmethod
+    def _extract_device_id_from_topic(topic: str) -> str | None:
+        """Fallback extraction of deviceId from MQTT topic segments."""
+        parts = topic.split("/")
+        for idx, part in enumerate(parts):
+            if part in ("devices", "things") and idx + 1 < len(parts):
+                return parts[idx + 1] or None
+        return None
 
     @staticmethod
     def _extract_report(payload: dict[str, Any]) -> dict[str, Any] | None:

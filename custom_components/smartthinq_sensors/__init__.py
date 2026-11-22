@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 import logging
 from typing import Any
 
@@ -86,7 +86,6 @@ AUTH_RETRY = "auth_retry"
 MAX_AUTH_RETRY = 4
 
 MAX_DISC_COUNT = 4
-MQTT_CONNECTED_FALLBACK_INTERVAL = 3600  # seconds (1 hour) when MQTT push is active
 SIGNAL_RELOAD_ENTRY = f"{DOMAIN}_reload_entry"
 
 DISCOVERED_DEVICES = "discovered_devices"
@@ -342,10 +341,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 if lge_dev.device.device_info.device_id == device_id:
                     hass.async_create_task(lge_dev.async_handle_mqtt_push(report))
 
-    mqtt_client = ThinQMQTTClient(client, _on_mqtt_push)
+    def _on_mqtt_refresh(device_id: str) -> None:
+        """Schedule single refresh when LG cloud sends dashboardRefresh/funcSyncRefresh."""
+        devices_map: dict[DeviceType, list[LGEDevice]] = hass.data.get(
+            DOMAIN, {}
+        ).get(LGE_DEVICES, {})
+        for dev_list in devices_map.values():
+            for lge_dev in dev_list:
+                if lge_dev.device.device_info.device_id == device_id:
+                    lge_dev.schedule_confirmation_poll(delay=1)
+
+    mqtt_client = ThinQMQTTClient(
+        client, _on_mqtt_push, on_refresh_callback=_on_mqtt_refresh
+    )
 
     async def _close_lg_client(event: Event) -> None:
         """Close client and MQTT listener to abort polling."""
+        for dev_list in hass.data.get(DOMAIN, {}).get(LGE_DEVICES, {}).values():
+            for lge_dev in dev_list:
+                await lge_dev.async_cancel_confirmation_poll()
         await mqtt_client.async_stop()
         await client.close()
 
@@ -405,6 +419,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         reload = data.get(SIGNAL_RELOAD_ENTRY, 0)
         if reload > 0:
             hass.data[DOMAIN] = {SIGNAL_RELOAD_ENTRY: reload}
+        for dev_list in data.get(LGE_DEVICES, {}).values():
+            for lge_dev in dev_list:
+                await lge_dev.async_cancel_confirmation_poll()
         if (mqtt_client := data.get(MQTT_CLIENT)) is not None:
             await mqtt_client.async_stop()
         if (client := data.get(CLIENT)) is not None:
@@ -439,7 +456,8 @@ class LGEDevice:
         self._disc_count = 0
         self._available = True
         self._update_lock = asyncio.Lock()
-        self._last_http_poll: datetime | None = None
+        self._fast_poll_task: asyncio.Task | None = None
+        self._force_http_poll: bool = False
 
     @property
     def available(self) -> bool:
@@ -524,6 +542,47 @@ class LGEDevice:
 
         return True
 
+    async def async_cancel_confirmation_poll(self) -> None:
+        """Cancel any scheduled confirmation poll task."""
+        task = self._fast_poll_task
+        self._fast_poll_task = None
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    def schedule_confirmation_poll(self, delay: int = 35) -> None:
+        """Schedule a single delayed confirmation HTTP refresh."""
+        if self._coordinator is None:
+            return
+        if self._fast_poll_task and not self._fast_poll_task.done():
+            self._fast_poll_task.cancel()
+        self._fast_poll_task = self._hass.async_create_task(
+            self._async_confirmation_poll(delay)
+        )
+
+    async def _async_confirmation_poll(self, delay: int) -> None:
+        """Execute one delayed HTTP refresh to confirm cloud/compressor state."""
+        try:
+            await asyncio.sleep(delay)
+            if self._coordinator is not None:
+                self._force_http_poll = True
+                try:
+                    await self._coordinator.async_request_refresh()
+                finally:
+                    self._force_http_poll = False
+        except asyncio.CancelledError:
+            return
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.debug(
+                "Confirmation poll failed for %s", self._name, exc_info=True
+            )
+        finally:
+            if self._fast_poll_task is asyncio.current_task():
+                self._fast_poll_task = None
+
     @callback
     def async_set_updated(self):
         """Manually update state and notify coordinator entities."""
@@ -554,7 +613,7 @@ class LGEDevice:
             if state:
                 self._disc_count = 0
                 self._state = state
-                self.async_set_updated()
+                self._coordinator.async_set_updated_data(self._state)
 
     async def _create_coordinator(self) -> None:
         """Get the coordinator for a specific device."""
@@ -578,7 +637,9 @@ class LGEDevice:
         return self._state
 
     def _should_skip_http_poll(self) -> bool:
-        """Return True if MQTT push is active and an HTTP poll can be skipped."""
+        """Return True if MQTT push is active and periodic HTTP polling can be skipped."""
+        if self._force_http_poll:
+            return False
         if self._device.device_info.platform_type != PlatformType.THINQ2:
             return False
         if self._state is None:
@@ -586,22 +647,15 @@ class LGEDevice:
         mqtt_client: ThinQMQTTClient | None = self._hass.data.get(DOMAIN, {}).get(
             MQTT_CLIENT
         )
-        if mqtt_client is None or not mqtt_client.is_connected:
-            return False
-        if not self._state.is_on:
-            return True
-        if self._last_http_poll is not None:
-            elapsed = (datetime.now(timezone.utc) - self._last_http_poll).total_seconds()
-            if elapsed < MQTT_CONNECTED_FALLBACK_INTERVAL:
-                return True
-        return False
+        return mqtt_client is not None and mqtt_client.is_connected
 
     async def _async_state_update(self):
         """Update device state."""
         async with self._update_lock:
             if self._should_skip_http_poll():
                 _LOGGER.debug(
-                    "Skipping HTTP poll for %s (MQTT push active)", self._name
+                    "Skipping HTTP poll for %s (MQTT push active)",
+                    self._name,
                 )
                 return
 
@@ -613,7 +667,6 @@ class LGEDevice:
                 # method poll should return None if status is not yet available
                 # or due to temporary connection failure that will be restored
                 state = await self._device.poll()
-                self._last_http_poll = datetime.now(timezone.utc)
 
             except (MonitorRefreshError, NotConnectedError):
                 # These exceptions are raised when device is not connected (turned off)

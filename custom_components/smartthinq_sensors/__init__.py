@@ -589,6 +589,23 @@ class LGEDevice:
         if self._coordinator:
             self._coordinator.async_set_updated_data(self._state)
 
+    async def _async_enable_events_delayed(self, delay: int = 3) -> None:
+        """Enable AC live telemetry events shortly after power-on."""
+        try:
+            await asyncio.sleep(delay)
+            if (
+                self._state
+                and self._state.is_on
+                and hasattr(self._device, "async_enable_events")
+            ):
+                await self._device.async_enable_events(timeout=70, min_interval=30)
+        except asyncio.CancelledError:
+            return
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.debug(
+                "Delayed event enable failed for %s", self._name, exc_info=True
+            )
+
     async def async_handle_mqtt_push(self, report: dict[str, Any]) -> None:
         """Update device state immediately from an incoming MQTT push payload."""
         if self._device.device_info.platform_type != PlatformType.THINQ2:
@@ -599,6 +616,9 @@ class LGEDevice:
         _LOGGER.debug("MQTT push received for %s", self._name)
         if report.get("online") is False:
             _LOGGER.debug("MQTT push reported device %s offline", self._name)
+
+        prev_is_on = bool(self._state and self._state.is_on)
+        turned_on = False
 
         async with self._update_lock:
             if not self._device.apply_push_snapshot(report):
@@ -613,7 +633,11 @@ class LGEDevice:
             if state:
                 self._disc_count = 0
                 self._state = state
+                turned_on = not prev_is_on and bool(state.is_on)
                 self._coordinator.async_set_updated_data(self._state)
+
+        if turned_on and hasattr(self._device, "async_enable_events"):
+            self._hass.async_create_task(self._async_enable_events_delayed(delay=3))
 
     async def _create_coordinator(self) -> None:
         """Get the coordinator for a specific device."""
@@ -657,6 +681,14 @@ class LGEDevice:
                     "Skipping HTTP poll for %s (MQTT push active)",
                     self._name,
                 )
+                if (
+                    self._state
+                    and self._state.is_on
+                    and hasattr(self._device, "async_enable_events")
+                ):
+                    await self._device.async_enable_events(
+                        timeout=70, min_interval=240
+                    )
                 return
 
             _LOGGER.debug("Updating ThinQ device %s", self._name)

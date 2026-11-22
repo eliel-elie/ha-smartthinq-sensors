@@ -4,14 +4,15 @@ from __future__ import annotations
 
 from enum import Enum
 import logging
+import time
 
 from ..backports.functools import cached_property
 from ..const import AirConditionerFeatures, TemperatureUnit
 from ..core_async import ClientAsync
-from ..core_exceptions import InvalidRequestError
+from ..core_exceptions import InvalidRequestError, UseOfficialAPIError
 from ..core_util import TempUnitConversion
 from ..device import Device, DeviceStatus
-from ..device_info import DeviceInfo
+from ..device_info import DeviceInfo, PlatformType
 from ..model_info import TYPE_RANGE
 
 AWHP_MODEL_TYPE = ["AWHP", "SAC_AWHP"]
@@ -298,6 +299,7 @@ class AirConditionerDevice(Device):
         self._current_power_supported = True
 
         self._filter_status = None
+        self._last_event_enable_ts: float = 0.0
         self._filter_status_supported = True
 
         self._unit_conv = TempUnitConversion()
@@ -900,11 +902,52 @@ class AirConditionerDevice(Device):
         self._status = AirConditionerStatus(self)
         return self._status
 
+    async def async_enable_events(
+        self, timeout: int = 70, min_interval: int = 0
+    ) -> bool:
+        """Enable live telemetry push events for ThinQ2 AC when powered on."""
+        if self.device_info.platform_type != PlatformType.THINQ2:
+            return False
+        if not self._model_info or not (self._status and self._status.is_on):
+            return False
+
+        now = time.monotonic()
+        if (
+            min_interval > 0
+            and self._last_event_enable_ts > 0
+            and (now - self._last_event_enable_ts) < min_interval
+        ):
+            return False
+
+        keys = self._get_cmd_keys(CMD_ENABLE_EVENT_V2)
+        for attempt in range(2):
+            try:
+                await self.set(
+                    keys[0],
+                    keys[1],
+                    key=keys[2],
+                    value=str(timeout),
+                    ctrl_path="control",
+                )
+                self._last_event_enable_ts = time.monotonic()
+                return True
+            except UseOfficialAPIError as exc:
+                if attempt == 0:
+                    _LOGGER.debug(
+                        "allEventEnable got 9006/9012 for %s, retrying with refreshed client_id",
+                        self.name,
+                    )
+                    continue
+                _LOGGER.debug("allEventEnable failed for %s: %s", self.name, exc)
+                return False
+            except Exception as exc:  # pylint: disable=broad-except
+                _LOGGER.debug("allEventEnable error for %s: %s", self.name, exc)
+                return False
+        return False
+
     async def _pre_update_v2(self):
         """Call additional methods before data update for v2 API."""
-        # LG mobile API blocks allEventEnable with error 9006; ThinQ2 AC devices
-        # publish state and energy telemetry automatically via MQTT push.
-        return
+        await self.async_enable_events(timeout=70, min_interval=240)
 
     async def _get_device_info(self):
         """

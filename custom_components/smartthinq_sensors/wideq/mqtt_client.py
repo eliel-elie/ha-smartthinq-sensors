@@ -10,7 +10,7 @@ import os
 import ssl
 import tempfile
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -248,108 +248,61 @@ class ThinQMQTTClient:
             return cert_pem + "\n"
         return f"-----BEGIN CERTIFICATE-----\n{cert_pem}\n-----END CERTIFICATE-----\n"
 
-    async def _post_certificate_direct(self, csr_pem: str) -> dict[str, Any]:
-        """Request mTLS certificate directly without security_key (Android APK flow)."""
-        auth = self._client.auth
-        core = auth.gateway.core
-        cert_url = urljoin(auth.gateway.thinq2_uri, CLIENT_CERT_PATH)
-        headers = core._thinq2_headers(
-            client_id=core._get_client_id(auth.user_number),
-            access_token=auth.access_token,
-            user_number=auth.user_number,
-            country=core.country,
-            language=core.language,
-            security_key=False,
-        )
-        async with core._get_session().post(
-            url=cert_url,
-            json={"csr": csr_pem},
-            headers=headers,
-            timeout=core._timeout,
-            raise_for_status=False,
-        ) as resp:
-            out = await core._get_json_resp(resp)
-
-        if "resultCode" not in out:
-            raise exc.APIError("-1", out)
-        return core._manage_lge_result(out, True, auth.user_number)
-
     async def async_register_client_and_get_cert(
         self,
     ) -> tuple[str, str, list[str]]:
         """Register client session and obtain a signed mTLS certificate."""
         await self._client.refresh_auth()
 
-        key_pem, csr_pem = await asyncio.to_thread(self._generate_csr)
-        cert_result: dict[str, Any] | None = None
-
-        thinq2_uri = getattr(self._client.auth.gateway, "thinq2_uri", None)
-        if isinstance(thinq2_uri, str) and thinq2_uri:
-            try:
-                cert_result = await self._call_with_client_id_retry(
-                    lambda: self._post_certificate_direct(csr_pem)
-                )
-            except (
-                exc.InvalidCredentialError,
-                exc.NotLoggedInError,
-                exc.TokenError,
-            ):
-                raise
-            except Exception as err:  # pylint: disable=broad-except
-                _LOGGER.debug(
-                    "Direct certificate request failed (%s), falling back to client registration flow",
-                    err,
-                )
-
-        if cert_result is None:
-            try:
-                await self._call_with_client_id_retry(
-                    lambda: self._client.session.post2(CLIENT_REG_PATH, {})
-                )
-            except (
-                exc.InvalidCredentialError,
-                exc.NotLoggedInError,
-                exc.TokenError,
-                exc.UseOfficialAPIError,
-            ):
-                raise
-            except exc.APIError as err:
-                # Client ID may already be registered on LG backend
-                _LOGGER.debug("Client registration returned non-fatal error: %s", err)
-
-            csr_clean = (
-                csr_pem.replace("-----BEGIN CERTIFICATE REQUEST-----", "")
-                .replace("-----END CERTIFICATE REQUEST-----", "")
-                .replace("\r", "")
-                .replace("\n", "")
-                .strip()
+        try:
+            await self._call_with_client_id_retry(
+                lambda: self._client.session.post2(CLIENT_REG_PATH, {})
             )
+        except (
+            exc.InvalidCredentialError,
+            exc.NotLoggedInError,
+            exc.TokenError,
+            exc.UseOfficialAPIError,
+        ):
+            raise
+        except exc.APIError as err:
+            # Client ID may already be registered on LG backend
+            _LOGGER.debug("Client registration returned non-fatal error: %s", err)
 
-            try:
-                cert_result = await self._call_with_client_id_retry(
-                    lambda: self._client.session.post2(
-                        CLIENT_CERT_PATH,
-                        {"service-code": SVC_CODE, "csr": csr_clean},
-                    )
+        key_pem, csr_pem = await asyncio.to_thread(self._generate_csr)
+        csr_clean = (
+            csr_pem.replace("-----BEGIN CERTIFICATE REQUEST-----", "")
+            .replace("-----END CERTIFICATE REQUEST-----", "")
+            .replace("\r", "")
+            .replace("\n", "")
+            .strip()
+        )
+
+        try:
+            cert_result = await self._call_with_client_id_retry(
+                lambda: self._client.session.post2(
+                    CLIENT_CERT_PATH,
+                    {"service-code": SVC_CODE, "csr": csr_clean},
                 )
-            except (
-                exc.InvalidCredentialError,
-                exc.NotLoggedInError,
-                exc.TokenError,
-                exc.UseOfficialAPIError,
-            ):
-                raise
-            except (exc.InvalidRequestError, exc.APIError) as err:
-                _LOGGER.debug(
-                    "Certificate request with stripped CSR failed (%s), retrying full PEM",
-                    err,
+            )
+        except (
+            exc.InvalidCredentialError,
+            exc.NotLoggedInError,
+            exc.TokenError,
+            exc.UseOfficialAPIError,
+        ):
+            raise
+        except (exc.InvalidRequestError, exc.APIError) as err:
+            _LOGGER.debug(
+                "Certificate request with stripped CSR failed (%s), retrying full PEM",
+                err,
+            )
+            cert_result = await self._call_with_client_id_retry(
+                lambda: self._client.session.post2(
+                    CLIENT_CERT_PATH,
+                    {"service-code": SVC_CODE, "csr": csr_pem},
                 )
-                cert_result = await self._call_with_client_id_retry(
-                    lambda: self._client.session.post2(
-                        CLIENT_CERT_PATH,
-                        {"service-code": SVC_CODE, "csr": csr_pem},
-                    )
-                )
+            )
 
         if not isinstance(cert_result, dict) or "certificatePem" not in cert_result:
             raise exc.InvalidResponseError(

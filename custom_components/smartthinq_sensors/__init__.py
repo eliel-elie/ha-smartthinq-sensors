@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import logging
+from typing import Any
 
 from homeassistant.components import persistent_notification
 from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
@@ -44,12 +46,14 @@ from .const import (
     LGE_DISCOVERY_NEW,
     MIN_HA_MAJ_VER,
     MIN_HA_MIN_VER,
+    MQTT_CLIENT,
     STARTUP,
     __min_ha_version__,
 )
 from .wideq import (
     DeviceInfo as ThinQDeviceInfo,
     DeviceType,
+    PlatformType,
     TemperatureUnit,
     get_lge_device,
 )
@@ -62,6 +66,7 @@ from .wideq.core_exceptions import (
     NotConnectedError,
 )
 from .wideq.device import Device as ThinQDevice
+from .wideq.mqtt_client import ThinQMQTTClient
 
 SMARTTHINQ_PLATFORMS = [
     Platform.BINARY_SENSOR,
@@ -81,6 +86,7 @@ AUTH_RETRY = "auth_retry"
 MAX_AUTH_RETRY = 4
 
 MAX_DISC_COUNT = 4
+MQTT_CONNECTED_FALLBACK_INTERVAL = 3600  # seconds (1 hour) when MQTT push is active
 SIGNAL_RELOAD_ENTRY = f"{DOMAIN}_reload_entry"
 
 DISCOVERED_DEVICES = "discovered_devices"
@@ -326,8 +332,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         async_dispatcher_connect(hass, SIGNAL_RELOAD_ENTRY, _async_call_reload_entry)
     )
 
+    def _on_mqtt_push(device_id: str, report: dict[str, Any]) -> None:
+        """Dispatch incoming MQTT push report to matching ThinQ devices."""
+        devices_map: dict[DeviceType, list[LGEDevice]] = hass.data.get(
+            DOMAIN, {}
+        ).get(LGE_DEVICES, {})
+        for dev_list in devices_map.values():
+            for lge_dev in dev_list:
+                if lge_dev.device.device_info.device_id == device_id:
+                    hass.async_create_task(lge_dev.async_handle_mqtt_push(report))
+
+    mqtt_client = ThinQMQTTClient(client, _on_mqtt_push)
+
     async def _close_lg_client(event: Event) -> None:
-        """Close client to abort pollong."""
+        """Close client and MQTT listener to abort polling."""
+        await mqtt_client.async_stop()
         await client.close()
 
     entry.async_on_unload(
@@ -338,6 +357,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN].update(
         {
             CLIENT: client,
+            MQTT_CLIENT: mqtt_client,
             LGE_DEVICES: lge_devices,
             UNSUPPORTED_DEVICES: unsupported_devices,
             DISCOVERED_DEVICES: discovered_devices,
@@ -347,6 +367,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entry, [p for p in SMARTTHINQ_PLATFORMS if p is not Platform.NUMBER]
     )
 
+    await mqtt_client.async_start()
     start_devices_discovery(hass, entry, client)
 
     return True
@@ -384,6 +405,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         reload = data.get(SIGNAL_RELOAD_ENTRY, 0)
         if reload > 0:
             hass.data[DOMAIN] = {SIGNAL_RELOAD_ENTRY: reload}
+        if (mqtt_client := data.get(MQTT_CLIENT)) is not None:
+            await mqtt_client.async_stop()
         if (client := data.get(CLIENT)) is not None:
             await client.close()
     return unload_ok
@@ -415,6 +438,8 @@ class LGEDevice:
         self._coordinator: DataUpdateCoordinator | None = None
         self._disc_count = 0
         self._available = True
+        self._update_lock = asyncio.Lock()
+        self._last_http_poll: datetime | None = None
 
     @property
     def available(self) -> bool:
@@ -505,6 +530,32 @@ class LGEDevice:
         if self._coordinator:
             self._coordinator.async_set_updated_data(self._state)
 
+    async def async_handle_mqtt_push(self, report: dict[str, Any]) -> None:
+        """Update device state immediately from an incoming MQTT push payload."""
+        if self._device.device_info.platform_type != PlatformType.THINQ2:
+            return
+        if self._coordinator is None:
+            return
+
+        _LOGGER.debug("MQTT push received for %s", self._name)
+        if report.get("online") is False:
+            _LOGGER.debug("MQTT push reported device %s offline", self._name)
+
+        async with self._update_lock:
+            if not self._device.apply_push_snapshot(report):
+                return
+            try:
+                state = await self._device.poll()
+            except Exception as exc:  # pylint: disable=broad-except
+                _LOGGER.debug("Error decoding MQTT push for %s: %s", self._name, exc)
+                return
+
+            self._available = True
+            if state:
+                self._disc_count = 0
+                self._state = state
+                self.async_set_updated()
+
     async def _create_coordinator(self) -> None:
         """Get the coordinator for a specific device."""
         interval = self._hass.data.get(DOMAIN, {}).get(
@@ -526,57 +577,84 @@ class LGEDevice:
         await self._async_state_update()
         return self._state
 
+    def _should_skip_http_poll(self) -> bool:
+        """Return True if MQTT push is active and an HTTP poll can be skipped."""
+        if self._device.device_info.platform_type != PlatformType.THINQ2:
+            return False
+        if self._state is None:
+            return False
+        mqtt_client: ThinQMQTTClient | None = self._hass.data.get(DOMAIN, {}).get(
+            MQTT_CLIENT
+        )
+        if mqtt_client is None or not mqtt_client.is_connected:
+            return False
+        if not self._state.is_on:
+            return True
+        if self._last_http_poll is not None:
+            elapsed = (datetime.now(timezone.utc) - self._last_http_poll).total_seconds()
+            if elapsed < MQTT_CONNECTED_FALLBACK_INTERVAL:
+                return True
+        return False
+
     async def _async_state_update(self):
         """Update device state."""
-        _LOGGER.debug("Updating ThinQ device %s", self._name)
-        if self._disc_count < MAX_DISC_COUNT:
-            self._disc_count += 1
+        async with self._update_lock:
+            if self._should_skip_http_poll():
+                _LOGGER.debug(
+                    "Skipping HTTP poll for %s (MQTT push active)", self._name
+                )
+                return
 
-        try:
-            # method poll should return None if status is not yet available
-            # or due to temporary connection failure that will be restored
-            state = await self._device.poll()
+            _LOGGER.debug("Updating ThinQ device %s", self._name)
+            if self._disc_count < MAX_DISC_COUNT:
+                self._disc_count += 1
 
-        except (MonitorRefreshError, NotConnectedError):
-            # These exceptions are raised when device is not connected (turned off)
-            # or unreachable due to network or API errors
-            # If device status is "on" we reset the status, otherwise we just
-            # ignore and use previous known state
-            state = None
-            if self._state.is_on and self._disc_count >= MAX_DISC_COUNT:
+            try:
+                # method poll should return None if status is not yet available
+                # or due to temporary connection failure that will be restored
+                state = await self._device.poll()
+                self._last_http_poll = datetime.now(timezone.utc)
+
+            except (MonitorRefreshError, NotConnectedError):
+                # These exceptions are raised when device is not connected (turned off)
+                # or unreachable due to network or API errors
+                # If device status is "on" we reset the status, otherwise we just
+                # ignore and use previous known state
+                state = None
+                if self._state.is_on and self._disc_count >= MAX_DISC_COUNT:
+                    _LOGGER.warning(
+                        "Status for device %s was reset because disconnected or unreachable",
+                        self._name,
+                    )
+                    self._state = self._device.reset_status()
+
+            except MonitorUnavailableError:
+                # This exception is raised when issue with ThinQ persist
+                # In this case available is set to false and device status
+                # is reset to avoid confusion when connection is restored
+                if not self._available:
+                    return
                 _LOGGER.warning(
-                    "Status for device %s was reset because disconnected or unreachable",
+                    "Status for device %s was reset because ThinQ connection not available",
                     self._name,
                 )
+                self._available = False
                 self._state = self._device.reset_status()
-
-        except MonitorUnavailableError:
-            # This exception is raised when issue with ThinQ persist
-            # In this case available is set to false and device status
-            # is reset to avoid confusion when connection is restored
-            if not self._available:
                 return
-            _LOGGER.warning(
-                "Status for device %s was reset because ThinQ connection not available",
-                self._name,
-            )
-            self._available = False
-            self._state = self._device.reset_status()
-            return
 
-        except InvalidCredentialError:
-            # If we receive invalid credential, we reload integration
-            # to provide proper notification
-            async_dispatcher_send(self._hass, SIGNAL_RELOAD_ENTRY)
-            return
+            except InvalidCredentialError:
+                # If we receive invalid credential, we reload integration
+                # to provide proper notification
+                async_dispatcher_send(self._hass, SIGNAL_RELOAD_ENTRY)
+                return
 
-        self._available = True
-        if state:
-            _LOGGER.debug("ThinQ status updated")
-            # l = dir(state)
-            # _LOGGER.debug('Status attributes: %s', l)
-            self._disc_count = 0
-            self._state = state
+            self._available = True
+            if state:
+                _LOGGER.debug("ThinQ status updated")
+                # l = dir(state)
+                # _LOGGER.debug('Status attributes: %s', l)
+                self._disc_count = 0
+                self._state = state
 
 
 async def lge_devices_setup(
@@ -756,7 +834,7 @@ def start_devices_discovery(
                     new_uns_devs[dev_type] = dev_list
             hass.data[DOMAIN][UNSUPPORTED_DEVICES] = new_uns_devs
 
-    # schedule discover new devices every 5 minutes
+    # schedule discover new devices every 60 minutes to minimize API calls
     entry.async_on_unload(
-        async_track_time_interval(hass, _async_discover_devices, timedelta(minutes=5))
+        async_track_time_interval(hass, _async_discover_devices, timedelta(minutes=60))
     )

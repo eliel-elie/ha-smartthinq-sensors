@@ -902,7 +902,9 @@ class AirConditionerDevice(Device):
 
     async def _pre_update_v2(self):
         """Call additional methods before data update for v2 API."""
-        # this command is to get power and temp info on V2 device
+        # Only request live telemetry events when the AC is initialized and powered on
+        if not self._model_info or not (self._status and self._status.is_on):
+            return
         keys = self._get_cmd_keys(CMD_ENABLE_EVENT_V2)
         await self.set(keys[0], keys[1], key=keys[2], value="70", ctrl_path="control")
 

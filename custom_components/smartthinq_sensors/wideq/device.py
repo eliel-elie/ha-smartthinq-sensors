@@ -382,6 +382,16 @@ def _remove_duplicated(elem: list) -> list:
     return list(dict.fromkeys(elem))
 
 
+def _deep_merge(target: dict, source: dict) -> dict:
+    """Recursively merge source dictionary into target dictionary."""
+    for key, value in source.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _deep_merge(target[key], value)
+        else:
+            target[key] = deepcopy(value)
+    return target
+
+
 class DeviceNotInitialized(Exception):
     """Device exception occurred when device is not initialized."""
 
@@ -418,6 +428,8 @@ class Device:
         self._control_set = 0
         self._last_additional_poll: datetime | None = None
         self._available_features = {}
+        self._push_received: bool = False
+        self._initial_snapshot_loaded: bool = False
 
         # attributes for properties
         self._attr_unique_id = self._device_info.device_id
@@ -477,6 +489,30 @@ class Device:
         """Reset the status objevt associated to the device."""
         self._status = None
         return self._status
+
+    def apply_push_snapshot(self, report: dict[str, Any]) -> bool:
+        """Merge an MQTT push report into the cached ThinQ2 device snapshot."""
+        if self._device_info.platform_type != PlatformType.THINQ2:
+            return False
+
+        dev_data = self._device_info._data
+        if "snapshot" not in dev_data or not isinstance(dev_data["snapshot"], dict):
+            dev_data["snapshot"] = {}
+        _deep_merge(dev_data["snapshot"], report)
+
+        # Keep ClientAsync cached device dictionary in sync as well
+        client_devices = getattr(self._client, "_devices", None)
+        if isinstance(client_devices, dict):
+            client_dev = client_devices.get(self._device_info.device_id)
+            if isinstance(client_dev, dict):
+                if "snapshot" not in client_dev or not isinstance(
+                    client_dev["snapshot"], dict
+                ):
+                    client_dev["snapshot"] = {}
+                _deep_merge(client_dev["snapshot"], report)
+
+        self._push_received = True
+        return True
 
     async def init_device_info(self) -> bool:
         """Initialize the information for the device"""
@@ -781,9 +817,24 @@ class Device:
 
         # ThinQ V2 - Monitor data is with device info
         if not self._should_poll:
+            if self._push_received:
+                self._push_received = False
+                snapshot = deepcopy(self._device_info.snapshot)
+                if not snapshot:
+                    return None
+                return self._model_info.decode_snapshot(snapshot, snapshot_key)
+
+            if not self._initial_snapshot_loaded and self._device_info.snapshot:
+                self._initial_snapshot_loaded = True
+                snapshot = deepcopy(self._device_info.snapshot)
+                return self._model_info.decode_snapshot(snapshot, snapshot_key)
+
             snapshot = await self._get_device_snapshot(thinq2_query_device)
             if not snapshot:
                 return None
+            self._initial_snapshot_loaded = True
+            # Keep local snapshot synced with latest full HTTP snapshot
+            self._device_info._data["snapshot"] = deepcopy(snapshot)
             # do additional poll
             if additional_poll_interval_v2 > 0:
                 await self._additional_poll(additional_poll_interval_v2)

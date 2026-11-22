@@ -1,7 +1,7 @@
 """Constants for LGE ThinQ custom component."""
 
-__version__ = "0.43.0"
-PROJECT_URL = "https://github.com/ollo69/ha-smartthinq-sensors/"
+__version__ = "0.44.0"
+PROJECT_URL = "https://github.com/eliel-elie/ha-smartthinq-sensors/"
 ISSUE_URL = f"{PROJECT_URL}issues"
 
 DOMAIN = "smartthinq_sensors"
@@ -49,6 +49,7 @@ MAX_SCAN_INTERVAL = 3600
 
 CLIENT = "client"
 LGE_DEVICES = "lge_devices"
+MQTT_CLIENT = "mqtt_client"
 
 LGE_DISCOVERY_NEW = f"{DOMAIN}_discovery_new"
 

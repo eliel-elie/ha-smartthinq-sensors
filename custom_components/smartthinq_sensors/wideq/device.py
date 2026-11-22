@@ -495,21 +495,32 @@ class Device:
         if self._device_info.platform_type != PlatformType.THINQ2:
             return False
 
-        dev_data = self._device_info._data
-        if "snapshot" not in dev_data or not isinstance(dev_data["snapshot"], dict):
-            dev_data["snapshot"] = {}
-        _deep_merge(dev_data["snapshot"], report)
+        def _merge_snapshot(target_container: dict[str, Any]) -> None:
+            if "snapshot" not in target_container or not isinstance(
+                target_container["snapshot"], dict
+            ):
+                target_container["snapshot"] = {}
+            snap = target_container["snapshot"]
+            prev_op = snap.get("airState.operation")
+            _deep_merge(snap, report)
+            if (
+                "airState.energy.onCurrent" in snap
+                and "airState.energy.onCurrent" not in report
+            ):
+                new_op = report.get("airState.operation")
+                if new_op in (0, "0") or (
+                    new_op in (1, "1") and prev_op in (0, "0", None)
+                ):
+                    snap["airState.energy.onCurrent"] = 0
+
+        _merge_snapshot(self._device_info._data)
 
         # Keep ClientAsync cached device dictionary in sync as well
         client_devices = getattr(self._client, "_devices", None)
         if isinstance(client_devices, dict):
             client_dev = client_devices.get(self._device_info.device_id)
             if isinstance(client_dev, dict):
-                if "snapshot" not in client_dev or not isinstance(
-                    client_dev["snapshot"], dict
-                ):
-                    client_dev["snapshot"] = {}
-                _deep_merge(client_dev["snapshot"], report)
+                _merge_snapshot(client_dev)
 
         self._push_received = True
         return True

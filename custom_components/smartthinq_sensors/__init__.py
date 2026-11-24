@@ -673,6 +673,32 @@ class LGEDevice:
         )
         return mqtt_client is not None and mqtt_client.is_connected
 
+    async def _async_mqtt_watchdog(
+        self, before_ts: float, delay: int = 12
+    ) -> None:
+        """Reconnect MQTT if allEventEnable succeeded but no push arrived."""
+        try:
+            await asyncio.sleep(delay)
+            mqtt_client: ThinQMQTTClient | None = self._hass.data.get(
+                DOMAIN, {}
+            ).get(MQTT_CLIENT)
+            if (
+                mqtt_client is not None
+                and mqtt_client.is_connected
+                and mqtt_client.last_message_ts <= before_ts
+            ):
+                _LOGGER.warning(
+                    "No MQTT push received after allEventEnable for %s; reconnecting MQTT",
+                    self._name,
+                )
+                await mqtt_client.async_reconnect()
+        except asyncio.CancelledError:
+            return
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.debug(
+                "MQTT watchdog error for %s", self._name, exc_info=True
+            )
+
     async def _async_state_update(self):
         """Update device state."""
         async with self._update_lock:
@@ -686,9 +712,18 @@ class LGEDevice:
                     and self._state.is_on
                     and hasattr(self._device, "async_enable_events")
                 ):
-                    await self._device.async_enable_events(
-                        timeout=70, min_interval=240
+                    mqtt_client: ThinQMQTTClient | None = self._hass.data.get(
+                        DOMAIN, {}
+                    ).get(MQTT_CLIENT)
+                    before_ts = (
+                        mqtt_client.last_message_ts if mqtt_client is not None else 0.0
                     )
+                    if await self._device.async_enable_events(
+                        timeout=70, min_interval=240
+                    ):
+                        self._hass.async_create_task(
+                            self._async_mqtt_watchdog(before_ts, delay=12)
+                        )
                 return
 
             _LOGGER.debug("Updating ThinQ device %s", self._name)

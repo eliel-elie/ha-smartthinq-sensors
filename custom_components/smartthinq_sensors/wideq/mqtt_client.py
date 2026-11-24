@@ -9,6 +9,7 @@ import logging
 import os
 import ssl
 import tempfile
+import time
 from typing import Any
 from urllib.parse import urlparse
 
@@ -41,6 +42,8 @@ MQTT_KEEPALIVE = 60
 CONNECT_TIMEOUT = 20
 INITIAL_RETRY_DELAY = 10
 MAX_RETRY_DELAY = 300
+MAX_SESSION_AGE = 4 * 3600
+SESSION_CHECK_INTERVAL = 60
 
 # Amazon Trust Services Root CA 1 (used to verify AWS IoT Core broker)
 AMAZON_ROOT_CA1_PEM = """-----BEGIN CERTIFICATE-----
@@ -93,11 +96,24 @@ class ThinQMQTTClient:
         self._subscriptions: list[str] = []
         self._is_connected = False
         self._connect_rc: int | None = None
+        self._connected_client_id: str | None = None
+        self._last_message_ts: float = 0.0
+        self._force_reconnect_requested = False
 
     @property
     def is_connected(self) -> bool:
         """Return True if the MQTT client is currently connected."""
         return self._is_connected
+
+    @property
+    def last_message_ts(self) -> float:
+        """Return monotonic timestamp of the last received MQTT message."""
+        return self._last_message_ts
+
+    async def async_reconnect(self) -> None:
+        """Force an immediate clean MQTT reconnection with fresh auth/cert."""
+        self._force_reconnect_requested = True
+        self._disconnected_event.set()
 
     async def async_start(self) -> None:
         """Start the MQTT connection supervision loop."""
@@ -147,11 +163,39 @@ class ThinQMQTTClient:
         retry_delay = INITIAL_RETRY_DELAY
 
         while not self._stop_event.is_set():
+            self._force_reconnect_requested = False
             try:
                 await self._connect_once()
                 retry_delay = INITIAL_RETRY_DELAY
-                # Wait until disconnected or stop requested
-                await self._disconnected_event.wait()
+                session_start_ts = time.monotonic()
+
+                # Supervise connection: wake on disconnect, client_id rotation, or 4h session renewal
+                while not self._stop_event.is_set():
+                    try:
+                        await asyncio.wait_for(
+                            self._disconnected_event.wait(),
+                            timeout=SESSION_CHECK_INTERVAL,
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        if self._stop_event.is_set():
+                            break
+                        if (
+                            self._connected_client_id
+                            and self._client.client_id != self._connected_client_id
+                        ):
+                            _LOGGER.info(
+                                "ThinQ client_id rotated, reconnecting MQTT with new session"
+                            )
+                            self._force_reconnect_requested = True
+                            break
+                        if (time.monotonic() - session_start_ts) >= MAX_SESSION_AGE:
+                            _LOGGER.info(
+                                "Renewing ThinQ MQTT session and certificate after %dh",
+                                MAX_SESSION_AGE // 3600,
+                            )
+                            self._force_reconnect_requested = True
+                            break
             except asyncio.CancelledError:
                 raise
             except (
@@ -176,6 +220,10 @@ class ThinQMQTTClient:
 
             if self._stop_event.is_set():
                 break
+
+            if self._force_reconnect_requested:
+                self._force_reconnect_requested = False
+                continue
 
             _LOGGER.debug("Reconnecting ThinQ MQTT in %s seconds", retry_delay)
             try:
@@ -400,13 +448,17 @@ class ThinQMQTTClient:
             mqtt_client = mqtt.Client(
                 callback_api_version=mqtt.CallbackAPIVersion.VERSION1,
                 client_id=client_id,
+                clean_session=True,
                 protocol=mqtt.MQTTv311,
             )
         else:
             mqtt_client = mqtt.Client(
                 client_id=client_id,
+                clean_session=True,
                 protocol=mqtt.MQTTv311,
             )
+
+        self._connected_client_id = client_id
 
         mqtt_client.tls_set_context(ssl_context)
         mqtt_client.on_connect = self._on_connect
@@ -491,6 +543,8 @@ class ThinQMQTTClient:
 
         if not isinstance(payload, dict):
             return
+
+        self._last_message_ts = time.monotonic()
 
         device_id = payload.get("deviceId") or self._extract_device_id_from_topic(
             msg.topic

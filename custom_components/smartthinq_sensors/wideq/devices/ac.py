@@ -9,7 +9,12 @@ import time
 from ..backports.functools import cached_property
 from ..const import AirConditionerFeatures, TemperatureUnit
 from ..core_async import ClientAsync
-from ..core_exceptions import InvalidRequestError, UseOfficialAPIError
+from ..core_exceptions import (
+    InvalidRequestError,
+    NotLoggedInError,
+    TokenError,
+    UseOfficialAPIError,
+)
 from ..core_util import TempUnitConversion
 from ..device import Device, DeviceStatus
 from ..device_info import DeviceInfo, PlatformType
@@ -920,7 +925,8 @@ class AirConditionerDevice(Device):
             return False
 
         keys = self._get_cmd_keys(CMD_ENABLE_EVENT_V2)
-        for attempt in range(2):
+        auth_refreshed = False
+        for attempt in range(3):
             try:
                 await self.set(
                     keys[0],
@@ -931,8 +937,27 @@ class AirConditionerDevice(Device):
                 )
                 self._last_event_enable_ts = time.monotonic()
                 return True
+            except (NotLoggedInError, TokenError) as exc:
+                if not auth_refreshed:
+                    auth_refreshed = True
+                    _LOGGER.debug(
+                        "allEventEnable got 0102/token error for %s, refreshing auth",
+                        self.name,
+                    )
+                    try:
+                        await self._client.refresh(refresh_gateway=False)
+                        continue
+                    except Exception as refresh_exc:  # pylint: disable=broad-except
+                        _LOGGER.debug(
+                            "Auth refresh failed during allEventEnable for %s: %s",
+                            self.name,
+                            refresh_exc,
+                        )
+                        return False
+                _LOGGER.debug("allEventEnable auth failed for %s: %s", self.name, exc)
+                return False
             except UseOfficialAPIError as exc:
-                if attempt == 0:
+                if attempt < 2:
                     _LOGGER.debug(
                         "allEventEnable got 9006/9012 for %s, retrying with refreshed client_id",
                         self.name,

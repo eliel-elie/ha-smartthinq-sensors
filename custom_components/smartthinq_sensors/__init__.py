@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Callable
 from datetime import timedelta
 import logging
+import time
 from typing import Any
 
 from homeassistant.components import persistent_notification
@@ -458,6 +459,7 @@ class LGEDevice:
         self._update_lock = asyncio.Lock()
         self._fast_poll_task: asyncio.Task | None = None
         self._force_http_poll: bool = False
+        self._last_http_poll_ts: float = 0.0
 
     @property
     def available(self) -> bool:
@@ -671,7 +673,19 @@ class LGEDevice:
         mqtt_client: ThinQMQTTClient | None = self._hass.data.get(DOMAIN, {}).get(
             MQTT_CLIENT
         )
-        return mqtt_client is not None and mqtt_client.is_connected
+        if mqtt_client is None or not mqtt_client.is_connected:
+            return False
+
+        # Run a lightweight safety HTTP poll every 15 minutes when no MQTT
+        # push arrived recently, keeping OAuth access_token and state synced.
+        now = time.monotonic()
+        if (
+            (now - self._last_http_poll_ts) >= 900
+            and (now - mqtt_client.last_message_ts) >= 900
+        ):
+            return False
+
+        return True
 
     async def _async_mqtt_watchdog(
         self, before_ts: float, delay: int = 12
@@ -733,6 +747,7 @@ class LGEDevice:
             try:
                 # method poll should return None if status is not yet available
                 # or due to temporary connection failure that will be restored
+                self._last_http_poll_ts = time.monotonic()
                 state = await self._device.poll()
 
             except (MonitorRefreshError, NotConnectedError):

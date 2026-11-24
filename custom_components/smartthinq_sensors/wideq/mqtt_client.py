@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+import hashlib
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ import tempfile
 import time
 from typing import Any
 from urllib.parse import urlparse
+import uuid
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -28,6 +30,7 @@ _LOGGER = logging.getLogger(__name__)
 ROUTE_URL = "https://common.lgthinq.com/route"
 CLIENT_REG_PATH = "service/users/client"
 CLIENT_CERT_PATH = "service/users/client/certificate"
+MQTT_DEVICE_TYPE = "601"
 
 ANDROID_ROUTE_HEADERS = {
     "User-Agent": "okhttp/4.10.0",
@@ -42,8 +45,9 @@ MQTT_KEEPALIVE = 60
 CONNECT_TIMEOUT = 20
 INITIAL_RETRY_DELAY = 10
 MAX_RETRY_DELAY = 300
-MAX_SESSION_AGE = 4 * 3600
-SESSION_CHECK_INTERVAL = 60
+MAX_SESSION_AGE = 55 * 60
+TOKEN_RENEW_MARGIN = 180
+SESSION_CHECK_INTERVAL = 15
 
 # Amazon Trust Services Root CA 1 (used to verify AWS IoT Core broker)
 AMAZON_ROOT_CA1_PEM = """-----BEGIN CERTIFICATE-----
@@ -89,6 +93,7 @@ class ThinQMQTTClient:
         self._runner_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
         self._connected_event = asyncio.Event()
+        self._subscribed_event = asyncio.Event()
         self._disconnected_event = asyncio.Event()
 
         self._mqtt_client: mqtt.Client | None = None
@@ -96,14 +101,31 @@ class ThinQMQTTClient:
         self._subscriptions: list[str] = []
         self._is_connected = False
         self._connect_rc: int | None = None
+        self._pending_sub_mid: int | None = None
+        self._suback_failed = False
+        self._registered_mqtt_client_id: str | None = None
         self._connected_client_id: str | None = None
+        self._connected_access_token: str | None = None
         self._last_message_ts: float = 0.0
         self._force_reconnect_requested = False
 
     @property
     def is_connected(self) -> bool:
-        """Return True if the MQTT client is currently connected."""
-        return self._is_connected
+        """Return True only when CONNACK+SUBACK succeeded and Paho socket is live."""
+        if not self._is_connected or self._mqtt_client is None:
+            return False
+        paho_is_connected = getattr(self._mqtt_client, "is_connected", None)
+        if callable(paho_is_connected):
+            try:
+                return bool(paho_is_connected())
+            except Exception:  # pylint: disable=broad-except
+                return False
+        return True
+
+    @property
+    def mqtt_client_id(self) -> str | None:
+        """Return the dedicated MQTT client ID currently registered."""
+        return self._connected_client_id
 
     @property
     def last_message_ts(self) -> float:
@@ -137,6 +159,39 @@ class ThinQMQTTClient:
             self._runner_task = None
 
         await self._cleanup_mqtt()
+        await self._async_deregister_client()
+
+    @staticmethod
+    def _generate_mqtt_client_id(user_number: str | None = None) -> str:
+        """Generate a fresh dedicated 64-hex SHA-256 client ID per MQTT session."""
+        seed = f"{user_number or ''}:{uuid.uuid4().hex}:{time.time_ns()}"
+        return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+    async def _async_deregister_client(
+        self, mqtt_client_id: str | None = None
+    ) -> None:
+        """Best-effort DELETE service/users/client; never raises on network errors."""
+        target_id = mqtt_client_id or self._registered_mqtt_client_id
+        if target_id and target_id == self._registered_mqtt_client_id:
+            self._registered_mqtt_client_id = None
+        if not target_id:
+            return
+        try:
+            delete2 = getattr(self._client.session, "delete2", None)
+            if callable(delete2):
+                await delete2(
+                    CLIENT_REG_PATH,
+                    headers={
+                        "x-client-id": target_id,
+                        "x-device-type": MQTT_DEVICE_TYPE,
+                    },
+                )
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.debug(
+                "ThinQ MQTT client deregistration ignored error (client=%s): %s",
+                target_id[:12],
+                err,
+            )
 
     async def _cleanup_mqtt(self) -> None:
         """Disconnect and stop the underlying Paho MQTT loop."""
@@ -169,7 +224,7 @@ class ThinQMQTTClient:
                 retry_delay = INITIAL_RETRY_DELAY
                 session_start_ts = time.monotonic()
 
-                # Supervise connection: wake on disconnect, client_id rotation, or 4h session renewal
+                # Supervise connection: wake on disconnect, socket drop, OAuth token rotation/expiry, or 55m renewal
                 while not self._stop_event.is_set():
                     try:
                         await asyncio.wait_for(
@@ -180,19 +235,41 @@ class ThinQMQTTClient:
                     except asyncio.TimeoutError:
                         if self._stop_event.is_set():
                             break
+                        if not self.is_connected:
+                            _LOGGER.warning(
+                                "ThinQ MQTT socket is no longer connected, reconnecting"
+                            )
+                            self._force_reconnect_requested = True
+                            break
+                        current_token = getattr(
+                            self._client.auth, "access_token", None
+                        )
                         if (
-                            self._connected_client_id
-                            and self._client.client_id != self._connected_client_id
+                            self._connected_access_token
+                            and current_token
+                            and current_token != self._connected_access_token
                         ):
                             _LOGGER.info(
-                                "ThinQ client_id rotated, reconnecting MQTT with new session"
+                                "ThinQ OAuth access_token rotated, renewing MQTT session"
+                            )
+                            self._force_reconnect_requested = True
+                            break
+                        seconds_left_fn = getattr(
+                            self._client.auth, "seconds_until_expiration", None
+                        )
+                        if (
+                            callable(seconds_left_fn)
+                            and seconds_left_fn() <= TOKEN_RENEW_MARGIN
+                        ):
+                            _LOGGER.info(
+                                "ThinQ OAuth access_token nearing expiry, refreshing token and MQTT session"
                             )
                             self._force_reconnect_requested = True
                             break
                         if (time.monotonic() - session_start_ts) >= MAX_SESSION_AGE:
                             _LOGGER.info(
-                                "Renewing ThinQ MQTT session and certificate after %dh",
-                                MAX_SESSION_AGE // 3600,
+                                "Renewing ThinQ MQTT session and certificate after %dm",
+                                MAX_SESSION_AGE // 60,
                             )
                             self._force_reconnect_requested = True
                             break
@@ -217,6 +294,7 @@ class ThinQMQTTClient:
                 _LOGGER.warning("ThinQ MQTT connection error: %s", err)
             finally:
                 await self._cleanup_mqtt()
+                await self._async_deregister_client()
 
             if self._stop_event.is_set():
                 break
@@ -299,23 +377,65 @@ class ThinQMQTTClient:
     async def async_register_client_and_get_cert(
         self,
     ) -> tuple[str, str, list[str]]:
-        """Register client session and obtain a signed mTLS certificate."""
-        await self._client.refresh_auth()
+        """Register dedicated MQTT client session and obtain a signed mTLS certificate."""
+        if self._registered_mqtt_client_id:
+            await self._async_deregister_client()
 
-        try:
-            await self._call_with_client_id_retry(
-                lambda: self._client.session.post2(CLIENT_REG_PATH, {})
+        seconds_left_fn = getattr(self._client.auth, "seconds_until_expiration", None)
+        force_token_refresh = (
+            callable(seconds_left_fn) and seconds_left_fn() <= TOKEN_RENEW_MARGIN
+        )
+        if force_token_refresh:
+            await self._client.refresh_auth(force_refresh=True)
+        else:
+            await self._client.refresh_auth()
+
+        self._connected_access_token = getattr(
+            self._client.auth, "access_token", None
+        )
+
+        mqtt_client_id = ""
+        for attempt in range(2):
+            mqtt_client_id = self._generate_mqtt_client_id(
+                getattr(self._client.auth, "user_number", None)
             )
-        except (
-            exc.InvalidCredentialError,
-            exc.NotLoggedInError,
-            exc.TokenError,
-            exc.UseOfficialAPIError,
-        ):
-            raise
-        except exc.APIError as err:
-            # Client ID may already be registered on LG backend
-            _LOGGER.debug("Client registration returned non-fatal error: %s", err)
+            reg_headers = {
+                "x-client-id": mqtt_client_id,
+                "x-device-type": MQTT_DEVICE_TYPE,
+            }
+            try:
+                await self._client.session.post2(
+                    CLIENT_REG_PATH, {}, headers=reg_headers
+                )
+                break
+            except exc.UseOfficialAPIError as err:
+                if attempt == 0:
+                    _LOGGER.debug(
+                        "MQTT client registration got 9006/9012 (%s), retrying with fresh mqtt_client_id",
+                        err,
+                    )
+                    continue
+                raise
+            except (
+                exc.InvalidCredentialError,
+                exc.NotLoggedInError,
+                exc.TokenError,
+            ):
+                raise
+            except exc.APIError as err:
+                _LOGGER.warning(
+                    "ThinQ MQTT client registration returned unexpected API error (client=%s): %s",
+                    mqtt_client_id[:12],
+                    err,
+                )
+                break
+
+        self._registered_mqtt_client_id = mqtt_client_id
+        self._connected_client_id = mqtt_client_id
+        cert_headers = {
+            "x-client-id": mqtt_client_id,
+            "x-device-type": MQTT_DEVICE_TYPE,
+        }
 
         key_pem, csr_pem = await asyncio.to_thread(self._generate_csr)
         csr_clean = (
@@ -327,11 +447,10 @@ class ThinQMQTTClient:
         )
 
         try:
-            cert_result = await self._call_with_client_id_retry(
-                lambda: self._client.session.post2(
-                    CLIENT_CERT_PATH,
-                    {"service-code": SVC_CODE, "csr": csr_clean},
-                )
+            cert_result = await self._client.session.post2(
+                CLIENT_CERT_PATH,
+                {"service-code": SVC_CODE, "csr": csr_clean},
+                headers=cert_headers,
             )
         except (
             exc.InvalidCredentialError,
@@ -345,11 +464,10 @@ class ThinQMQTTClient:
                 "Certificate request with stripped CSR failed (%s), retrying full PEM",
                 err,
             )
-            cert_result = await self._call_with_client_id_retry(
-                lambda: self._client.session.post2(
-                    CLIENT_CERT_PATH,
-                    {"service-code": SVC_CODE, "csr": csr_pem},
-                )
+            cert_result = await self._client.session.post2(
+                CLIENT_CERT_PATH,
+                {"service-code": SVC_CODE, "csr": csr_pem},
+                headers=cert_headers,
             )
 
         if not isinstance(cert_result, dict) or "certificatePem" not in cert_result:
@@ -404,11 +522,22 @@ class ThinQMQTTClient:
 
         return context
 
+    async def _wait_connected_and_subscribed(self) -> None:
+        """Wait for both MQTT CONNACK and SUBACK events."""
+        await self._connected_event.wait()
+        if self._connect_rc not in (None, 0):
+            return
+        await self._subscribed_event.wait()
+
     async def _connect_once(self) -> None:
-        """Perform route discovery, cert provisioning, and MQTT connect."""
+        """Perform route discovery, cert provisioning, MQTT connect, and SUBACK validation."""
         self._connected_event.clear()
+        self._subscribed_event.clear()
         self._disconnected_event.clear()
         self._connect_rc = None
+        self._pending_sub_mid = None
+        self._suback_failed = False
+        self._is_connected = False
 
         if not self._mqtt_server_url:
             route = await self.async_get_route()
@@ -432,9 +561,9 @@ class ThinQMQTTClient:
         cert_pem, key_pem, subscriptions = await self.async_register_client_and_get_cert()
         self._subscriptions = subscriptions
 
-        client_id = self._client.client_id
+        client_id = self._connected_client_id
         if not client_id:
-            raise exc.AuthenticationError("ThinQ client_id is not initialized")
+            raise exc.AuthenticationError("ThinQ MQTT client_id is not initialized")
 
         ssl_context = await asyncio.to_thread(
             self._create_ssl_context,
@@ -458,28 +587,37 @@ class ThinQMQTTClient:
                 protocol=mqtt.MQTTv311,
             )
 
-        self._connected_client_id = client_id
-
         mqtt_client.tls_set_context(ssl_context)
         mqtt_client.on_connect = self._on_connect
+        mqtt_client.on_subscribe = self._on_subscribe
         mqtt_client.on_disconnect = self._on_disconnect
         mqtt_client.on_message = self._on_message
 
         self._mqtt_client = mqtt_client
 
-        _LOGGER.debug("Connecting to ThinQ MQTT broker %s:%s", host, port)
+        _LOGGER.debug(
+            "Connecting to ThinQ MQTT broker %s:%s (client=%s)",
+            host,
+            port,
+            client_id[:12],
+        )
         mqtt_client.loop_start()
         try:
             await asyncio.to_thread(mqtt_client.connect, host, port, MQTT_KEEPALIVE)
             await asyncio.wait_for(
-                self._connected_event.wait(), timeout=CONNECT_TIMEOUT
+                self._wait_connected_and_subscribed(), timeout=CONNECT_TIMEOUT
             )
             if self._connect_rc not in (None, 0):
                 raise exc.AuthenticationError(
                     f"ThinQ MQTT connection rejected with code {self._connect_rc}"
                 )
+            if self._suback_failed or not self.is_connected:
+                raise exc.AuthenticationError(
+                    "ThinQ MQTT subscription rejected or socket disconnected before SUBACK"
+                )
         except Exception:
             await self._cleanup_mqtt()
+            await self._async_deregister_client()
             raise
 
     def _on_connect(
@@ -489,26 +627,79 @@ class ThinQMQTTClient:
         flags: dict,  # pylint: disable=unused-argument
         rc: int,
     ) -> None:
-        """Handle MQTT CONNACK and subscribe to ThinQ push topics."""
+        """Handle MQTT CONNACK and initiate topic subscriptions (awaiting SUBACK)."""
         self._connect_rc = rc
         if rc != 0:
             _LOGGER.warning("ThinQ MQTT connection rejected with code %s", rc)
             if self._loop:
                 self._loop.call_soon_threadsafe(self._connected_event.set)
+                self._loop.call_soon_threadsafe(self._subscribed_event.set)
                 self._loop.call_soon_threadsafe(self._disconnected_event.set)
             return
 
-        self._is_connected = True
+        topic_pairs = [(topic, 1) for topic in self._subscriptions]
         for topic in self._subscriptions:
             _LOGGER.debug("Subscribing to ThinQ MQTT topic: %s", topic)
-            client.subscribe(topic, qos=1)
 
-        _LOGGER.info(
-            "Connected to ThinQ MQTT push broker (%d topic(s) subscribed)",
-            len(self._subscriptions),
-        )
+        res, mid = client.subscribe(topic_pairs)
+        if res != mqtt.MQTT_ERR_SUCCESS:
+            _LOGGER.warning(
+                "ThinQ MQTT subscribe request failed immediately (rc=%s)", res
+            )
+            self._suback_failed = True
+            self._is_connected = False
+            if self._loop:
+                self._loop.call_soon_threadsafe(self._connected_event.set)
+                self._loop.call_soon_threadsafe(self._subscribed_event.set)
+                self._loop.call_soon_threadsafe(self._disconnected_event.set)
+            return
+
+        self._pending_sub_mid = mid
         if self._loop:
             self._loop.call_soon_threadsafe(self._connected_event.set)
+
+    def _on_subscribe(
+        self,
+        client: mqtt.Client,  # pylint: disable=unused-argument
+        userdata: Any,  # pylint: disable=unused-argument
+        mid: int,
+        granted_qos: Any,
+        *args: Any,  # pylint: disable=unused-argument
+    ) -> None:
+        """Validate MQTT SUBACK granted QoS before marking connection active."""
+        if self._pending_sub_mid is not None and mid != self._pending_sub_mid:
+            return
+
+        try:
+            qos_values = [
+                int(q.value) if hasattr(q, "value") else int(q)
+                for q in (granted_qos or ())
+            ]
+        except (TypeError, ValueError):
+            qos_values = []
+
+        if not qos_values or any(q >= 0x80 for q in qos_values):
+            _LOGGER.warning(
+                "ThinQ MQTT subscription rejected by broker (mid=%s, granted_qos=%s)",
+                mid,
+                qos_values,
+            )
+            self._suback_failed = True
+            self._is_connected = False
+            if self._loop:
+                self._loop.call_soon_threadsafe(self._subscribed_event.set)
+                self._loop.call_soon_threadsafe(self._disconnected_event.set)
+            return
+
+        self._suback_failed = False
+        self._is_connected = True
+        _LOGGER.info(
+            "Connected to ThinQ MQTT push broker (%d topic(s) subscribed, QoS=%s)",
+            len(self._subscriptions),
+            qos_values,
+        )
+        if self._loop:
+            self._loop.call_soon_threadsafe(self._subscribed_event.set)
             if self._on_connect_callback:
                 self._loop.call_soon_threadsafe(self._on_connect_callback)
 

@@ -970,9 +970,13 @@ class AirConditionerDevice(Device):
                 return False
         return False
 
+    def reset_event_enable_cooldown(self) -> None:
+        """Reset rate-limit cooldown so allEventEnable can be re-sent immediately."""
+        self._last_event_enable_ts = 0.0
+
     async def _pre_update_v2(self):
         """Call additional methods before data update for v2 API."""
-        await self.async_enable_events(timeout=70, min_interval=240)
+        return
 
     async def _get_device_info(self):
         """

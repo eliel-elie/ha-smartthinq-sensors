@@ -412,10 +412,58 @@ class CoreAsync:
 
         _LOGGER.debug("lgedm2_post after: %s", out)
 
-        return self._manage_lge_result(out, is_api_v2, user_number)
+        rotate_id = not (headers and "x-client-id" in headers)
+        return self._manage_lge_result(
+            out, is_api_v2, user_number, rotate_client_id=rotate_id
+        )
+
+    async def lgedm2_delete(
+        self,
+        url: str,
+        data: dict | None = None,
+        access_token: str | None = None,
+        user_number: str | None = None,
+        headers: dict | None = None,
+    ) -> dict:
+        """Make a DELETE HTTP request in the format used by the API2 servers."""
+
+        _LOGGER.debug("lgedm2_delete before: %s", url)
+
+        client_id = self._get_client_id(user_number)
+        req_kwargs: dict[str, Any] = {
+            "url": url,
+            "headers": self._thinq2_headers(
+                client_id=client_id,
+                access_token=access_token,
+                user_number=user_number,
+                extra_headers=headers or {},
+                country=self._country,
+                language=self._language,
+                security_key=True,
+            ),
+            "timeout": self._timeout,
+            "raise_for_status": False,
+        }
+        if data is not None:
+            req_kwargs["json"] = data
+
+        async with self._get_session().delete(**req_kwargs) as resp:
+            out = await self._get_json_resp(resp)
+
+        _LOGGER.debug("lgedm2_delete after: %s", out)
+
+        rotate_id = not (headers and "x-client-id" in headers)
+        return self._manage_lge_result(
+            out, True, user_number, rotate_client_id=rotate_id
+        )
 
     def _manage_lge_result(
-        self, result: dict, is_api_v2=False, user_number: str | None = None
+        self,
+        result: dict,
+        is_api_v2=False,
+        user_number: str | None = None,
+        *,
+        rotate_client_id: bool = True,
     ) -> dict:
         """Manage the result from a get or a post to lge server."""
 
@@ -423,7 +471,7 @@ class CoreAsync:
             if "resultCode" in result:
                 code = result["resultCode"]
                 if code != "0000":
-                    if code in ("9006", "9012"):
+                    if code in ("9006", "9012") and rotate_client_id:
                         # this are messages "Please consider using the official API" or "consider using native API"
                         # we refresh the client_id as work-around
                         _LOGGER.info(
@@ -1058,6 +1106,13 @@ class Auth:
         """
         return Session(self)
 
+    def seconds_until_expiration(self) -> float:
+        """Return remaining validity in seconds for the current access_token."""
+        if not self.access_token:
+            return 0.0
+        elapsed = (datetime.now(timezone.utc) - self._token_created_on).total_seconds()
+        return max(0.0, float(self.token_validity) - elapsed)
+
     async def refresh(self, force_refresh=False) -> Auth:
         """Refresh the authentication token, returning a new Auth object."""
 
@@ -1132,9 +1187,9 @@ class Session:
         """Return common language pack url."""
         return self._common_lang_pack_url
 
-    async def refresh_auth(self) -> Auth:
+    async def refresh_auth(self, force_refresh: bool = False) -> Auth:
         """Refresh associated authentication."""
-        self._auth = await self._auth.refresh()
+        self._auth = await self._auth.refresh(force_refresh=force_refresh)
         return self._auth
 
     async def post(self, path: str, data: dict | None = None) -> dict:
@@ -1154,7 +1209,13 @@ class Session:
             is_api_v2=False,
         )
 
-    async def post2(self, path: str, data: dict | None = None) -> dict:
+    async def post2(
+        self,
+        path: str,
+        data: dict | None = None,
+        *,
+        headers: dict | None = None,
+    ) -> dict:
         """
         Make a POST request to the APIv2 server.
 
@@ -1167,7 +1228,25 @@ class Session:
             data,
             self._auth.access_token,
             self._auth.user_number,
+            headers=headers,
             is_api_v2=True,
+        )
+
+    async def delete2(
+        self,
+        path: str,
+        data: dict | None = None,
+        *,
+        headers: dict | None = None,
+    ) -> dict:
+        """Make a DELETE request to the APIv2 server."""
+        url = urljoin(self._auth.gateway.thinq2_uri, path)
+        return await self._auth.gateway.core.lgedm2_delete(
+            url,
+            data,
+            self._auth.access_token,
+            self._auth.user_number,
+            headers=headers,
         )
 
     async def get(self, path: str) -> dict:
@@ -1600,10 +1679,10 @@ class ClientAsync:
         self._session = self.auth.start_session()
         await self._load_devices()
 
-    async def refresh_auth(self) -> None:
+    async def refresh_auth(self, force_refresh: bool = False) -> None:
         """Refresh auth token if requested."""
         if self._session:
-            self._auth = await self._session.refresh_auth()
+            self._auth = await self._session.refresh_auth(force_refresh=force_refresh)
         else:
             await self.refresh()
 

@@ -458,8 +458,11 @@ class LGEDevice:
         self._available = True
         self._update_lock = asyncio.Lock()
         self._fast_poll_task: asyncio.Task | None = None
+        self._event_enable_task: asyncio.Task | None = None
+        self._watchdog_task: asyncio.Task | None = None
         self._force_http_poll: bool = False
         self._last_http_poll_ts: float = 0.0
+        self._last_known_is_on: bool = False
 
     @property
     def available(self) -> bool:
@@ -538,6 +541,7 @@ class LGEDevice:
 
         # Create status update coordinator
         await self._create_coordinator()
+        self._last_known_is_on = bool(self._state and self._state.is_on)
 
         # Initialize device features
         _ = self._state.device_features
@@ -545,15 +549,22 @@ class LGEDevice:
         return True
 
     async def async_cancel_confirmation_poll(self) -> None:
-        """Cancel any scheduled confirmation poll task."""
-        task = self._fast_poll_task
+        """Cancel any scheduled confirmation poll, event-enable, or watchdog tasks."""
+        tasks = [
+            self._fast_poll_task,
+            self._event_enable_task,
+            self._watchdog_task,
+        ]
         self._fast_poll_task = None
-        if task and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        self._event_enable_task = None
+        self._watchdog_task = None
+        for task in tasks:
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
     def schedule_confirmation_poll(self, delay: int = 35) -> None:
         """Schedule a single delayed confirmation HTTP refresh."""
@@ -588,25 +599,78 @@ class LGEDevice:
     @callback
     def async_set_updated(self):
         """Manually update state and notify coordinator entities."""
+        now_is_on = bool(self._state and self._state.is_on)
+        turned_on = not self._last_known_is_on and now_is_on
+        self._last_known_is_on = now_is_on
         if self._coordinator:
             self._coordinator.async_set_updated_data(self._state)
+        if (
+            turned_on
+            and self._device.device_info.platform_type == PlatformType.THINQ2
+        ):
+            if hasattr(self._device, "async_enable_events"):
+                self._schedule_ac_events_and_watchdog(min_interval=0, delay=3)
+            self.schedule_confirmation_poll(delay=15)
 
-    async def _async_enable_events_delayed(self, delay: int = 3) -> None:
-        """Enable AC live telemetry events shortly after power-on."""
+    def _schedule_ac_events_and_watchdog(
+        self,
+        *,
+        min_interval: int = 240,
+        delay: int = 0,
+        allow_watchdog_recovery: bool = True,
+    ) -> None:
+        """Schedule background AC allEventEnable paired with MQTT watchdog."""
+        if self._event_enable_task and not self._event_enable_task.done():
+            self._event_enable_task.cancel()
+        self._event_enable_task = self._hass.async_create_task(
+            self._async_trigger_ac_events_and_watchdog(
+                min_interval=min_interval,
+                delay=delay,
+                allow_watchdog_recovery=allow_watchdog_recovery,
+            )
+        )
+
+    async def _async_trigger_ac_events_and_watchdog(
+        self,
+        *,
+        min_interval: int = 240,
+        delay: int = 0,
+        allow_watchdog_recovery: bool = True,
+    ) -> None:
+        """Enable AC live telemetry events and start MQTT delivery watchdog."""
         try:
-            await asyncio.sleep(delay)
-            if (
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if not (
                 self._state
                 and self._state.is_on
                 and hasattr(self._device, "async_enable_events")
             ):
-                await self._device.async_enable_events(timeout=70, min_interval=30)
+                return
+            mqtt_client: ThinQMQTTClient | None = self._hass.data.get(
+                DOMAIN, {}
+            ).get(MQTT_CLIENT)
+            before_ts = (
+                mqtt_client.last_message_ts if mqtt_client is not None else 0.0
+            )
+            if await self._device.async_enable_events(
+                timeout=70, min_interval=min_interval
+            ):
+                if allow_watchdog_recovery:
+                    if self._watchdog_task and not self._watchdog_task.done():
+                        self._watchdog_task.cancel()
+                    self._watchdog_task = self._hass.async_create_task(
+                        self._async_mqtt_watchdog(before_ts, delay=12)
+                    )
         except asyncio.CancelledError:
             return
         except Exception:  # pylint: disable=broad-except
             _LOGGER.debug(
-                "Delayed event enable failed for %s", self._name, exc_info=True
+                "AC event enable failed for %s", self._name, exc_info=True
             )
+        finally:
+            if self._event_enable_task is asyncio.current_task():
+                self._event_enable_task = None
 
     async def async_handle_mqtt_push(self, report: dict[str, Any]) -> None:
         """Update device state immediately from an incoming MQTT push payload."""
@@ -619,10 +683,10 @@ class LGEDevice:
         if report.get("online") is False:
             _LOGGER.debug("MQTT push reported device %s offline", self._name)
 
-        prev_is_on = bool(self._state and self._state.is_on)
         turned_on = False
 
         async with self._update_lock:
+            prev_is_on = self._last_known_is_on
             if not self._device.apply_push_snapshot(report):
                 return
             try:
@@ -635,11 +699,13 @@ class LGEDevice:
             if state:
                 self._disc_count = 0
                 self._state = state
-                turned_on = not prev_is_on and bool(state.is_on)
+                now_is_on = bool(state.is_on)
+                turned_on = not prev_is_on and now_is_on
+                self._last_known_is_on = now_is_on
                 self._coordinator.async_set_updated_data(self._state)
 
         if turned_on and hasattr(self._device, "async_enable_events"):
-            self._hass.async_create_task(self._async_enable_events_delayed(delay=3))
+            self._schedule_ac_events_and_watchdog(min_interval=30, delay=3)
 
     async def _create_coordinator(self) -> None:
         """Get the coordinator for a specific device."""
@@ -690,7 +756,7 @@ class LGEDevice:
     async def _async_mqtt_watchdog(
         self, before_ts: float, delay: int = 12
     ) -> None:
-        """Reconnect MQTT if allEventEnable succeeded but no push arrived."""
+        """Reconnect MQTT, re-arm events, and confirm via HTTP if no push arrived."""
         try:
             await asyncio.sleep(delay)
             mqtt_client: ThinQMQTTClient | None = self._hass.data.get(
@@ -706,90 +772,115 @@ class LGEDevice:
                     self._name,
                 )
                 await mqtt_client.async_reconnect()
+                if hasattr(self._device, "reset_event_enable_cooldown"):
+                    self._device.reset_event_enable_cooldown()
+                self._schedule_ac_events_and_watchdog(
+                    min_interval=0, delay=4, allow_watchdog_recovery=False
+                )
+                self.schedule_confirmation_poll(delay=6)
         except asyncio.CancelledError:
             return
         except Exception:  # pylint: disable=broad-except
             _LOGGER.debug(
                 "MQTT watchdog error for %s", self._name, exc_info=True
             )
+        finally:
+            if self._watchdog_task is asyncio.current_task():
+                self._watchdog_task = None
 
     async def _async_state_update(self):
         """Update device state."""
+        skip_poll = False
+        post_poll_turn_on = False
+        post_poll_stay_on = False
         async with self._update_lock:
             if self._should_skip_http_poll():
                 _LOGGER.debug(
                     "Skipping HTTP poll for %s (MQTT push active)",
                     self._name,
                 )
+                skip_poll = True
                 if (
                     self._state
                     and self._state.is_on
                     and hasattr(self._device, "async_enable_events")
                 ):
-                    mqtt_client: ThinQMQTTClient | None = self._hass.data.get(
-                        DOMAIN, {}
-                    ).get(MQTT_CLIENT)
-                    before_ts = (
-                        mqtt_client.last_message_ts if mqtt_client is not None else 0.0
-                    )
-                    if await self._device.async_enable_events(
-                        timeout=70, min_interval=240
-                    ):
-                        self._hass.async_create_task(
-                            self._async_mqtt_watchdog(before_ts, delay=12)
+                    post_poll_stay_on = True
+            else:
+                _LOGGER.debug("Updating ThinQ device %s", self._name)
+                prev_is_on = self._last_known_is_on
+                if self._disc_count < MAX_DISC_COUNT:
+                    self._disc_count += 1
+
+                try:
+                    # method poll should return None if status is not yet available
+                    # or due to temporary connection failure that will be restored
+                    self._last_http_poll_ts = time.monotonic()
+                    state = await self._device.poll()
+
+                except (MonitorRefreshError, NotConnectedError):
+                    # These exceptions are raised when device is not connected (turned off)
+                    # or unreachable due to network or API errors
+                    # If device status is "on" we reset the status, otherwise we just
+                    # ignore and use previous known state
+                    state = None
+                    if self._state.is_on and self._disc_count >= MAX_DISC_COUNT:
+                        _LOGGER.warning(
+                            "Status for device %s was reset because disconnected or unreachable",
+                            self._name,
                         )
-                return
+                        self._state = self._device.reset_status()
+                        self._last_known_is_on = False
 
-            _LOGGER.debug("Updating ThinQ device %s", self._name)
-            if self._disc_count < MAX_DISC_COUNT:
-                self._disc_count += 1
-
-            try:
-                # method poll should return None if status is not yet available
-                # or due to temporary connection failure that will be restored
-                self._last_http_poll_ts = time.monotonic()
-                state = await self._device.poll()
-
-            except (MonitorRefreshError, NotConnectedError):
-                # These exceptions are raised when device is not connected (turned off)
-                # or unreachable due to network or API errors
-                # If device status is "on" we reset the status, otherwise we just
-                # ignore and use previous known state
-                state = None
-                if self._state.is_on and self._disc_count >= MAX_DISC_COUNT:
+                except MonitorUnavailableError:
+                    # This exception is raised when issue with ThinQ persist
+                    # In this case available is set to false and device status
+                    # is reset to avoid confusion when connection is restored
+                    if not self._available:
+                        return
                     _LOGGER.warning(
-                        "Status for device %s was reset because disconnected or unreachable",
+                        "Status for device %s was reset because ThinQ connection not available",
                         self._name,
                     )
+                    self._available = False
                     self._state = self._device.reset_status()
-
-            except MonitorUnavailableError:
-                # This exception is raised when issue with ThinQ persist
-                # In this case available is set to false and device status
-                # is reset to avoid confusion when connection is restored
-                if not self._available:
+                    self._last_known_is_on = False
                     return
-                _LOGGER.warning(
-                    "Status for device %s was reset because ThinQ connection not available",
-                    self._name,
+
+                except InvalidCredentialError:
+                    # If we receive invalid credential, we reload integration
+                    # to provide proper notification
+                    async_dispatcher_send(self._hass, SIGNAL_RELOAD_ENTRY)
+                    return
+
+                self._available = True
+                if state:
+                    _LOGGER.debug("ThinQ status updated")
+                    # l = dir(state)
+                    # _LOGGER.debug('Status attributes: %s', l)
+                    self._disc_count = 0
+                    self._state = state
+                    now_is_on = bool(state.is_on)
+                    self._last_known_is_on = now_is_on
+                    if now_is_on and hasattr(self._device, "async_enable_events"):
+                        if not prev_is_on:
+                            post_poll_turn_on = True
+                        else:
+                            post_poll_stay_on = True
+
+        if skip_poll:
+            if post_poll_stay_on:
+                await self._async_trigger_ac_events_and_watchdog(
+                    min_interval=240, delay=0
                 )
-                self._available = False
-                self._state = self._device.reset_status()
-                return
+            return
 
-            except InvalidCredentialError:
-                # If we receive invalid credential, we reload integration
-                # to provide proper notification
-                async_dispatcher_send(self._hass, SIGNAL_RELOAD_ENTRY)
-                return
-
-            self._available = True
-            if state:
-                _LOGGER.debug("ThinQ status updated")
-                # l = dir(state)
-                # _LOGGER.debug('Status attributes: %s', l)
-                self._disc_count = 0
-                self._state = state
+        if post_poll_turn_on:
+            self._schedule_ac_events_and_watchdog(min_interval=0, delay=1)
+        elif post_poll_stay_on:
+            await self._async_trigger_ac_events_and_watchdog(
+                min_interval=240, delay=0
+            )
 
 
 async def lge_devices_setup(
